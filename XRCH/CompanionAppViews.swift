@@ -1,4 +1,5 @@
 import Combine
+import CoreLocation
 import MapKit
 import SwiftUI
 
@@ -14,6 +15,188 @@ struct CompanionPOI: Identifiable, Hashable {
     let rating: Double
 }
 
+struct RecommendationMessage: Identifiable {
+    enum Role { case user, assistant }
+    let id = UUID()
+    let role: Role
+    let text: String
+    let places: [CompanionPOI]
+}
+
+@MainActor
+private final class RecommendationLocationProvider: NSObject, CLLocationManagerDelegate {
+    private let manager = CLLocationManager()
+    private var completions: [(Result<CLLocation, Error>) -> Void] = []
+
+    override init() {
+        super.init()
+        manager.delegate = self
+        manager.desiredAccuracy = kCLLocationAccuracyNearestTenMeters
+    }
+
+    func request(_ completion: @escaping (Result<CLLocation, Error>) -> Void) {
+        completions.append(completion)
+        guard completions.count == 1 else { return }
+        switch manager.authorizationStatus {
+        case .authorizedAlways, .authorizedWhenInUse: manager.requestLocation()
+        case .notDetermined: manager.requestWhenInUseAuthorization()
+        case .denied, .restricted:
+            finish(.failure(RecommendationError.locationUnavailable))
+        @unknown default:
+            finish(.failure(RecommendationError.locationUnavailable))
+        }
+    }
+
+    func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
+        guard !completions.isEmpty else { return }
+        switch manager.authorizationStatus {
+        case .authorizedAlways, .authorizedWhenInUse: manager.requestLocation()
+        case .denied, .restricted: finish(.failure(RecommendationError.locationUnavailable))
+        default: break
+        }
+    }
+
+    func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
+        guard let location = locations.last(where: { $0.horizontalAccuracy >= 0 }) else { return }
+        finish(.success(location))
+    }
+
+    func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
+        finish(.failure(error))
+    }
+
+    private func finish(_ result: Result<CLLocation, Error>) {
+        let callbacks = completions
+        completions.removeAll()
+        callbacks.forEach { $0(result) }
+    }
+}
+
+private enum RecommendationError: LocalizedError {
+    case locationUnavailable, invalidResponse, server(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .locationUnavailable: "위치 접근을 허용한 뒤 다시 시도해 주세요."
+        case .invalidResponse: "추천 응답을 읽을 수 없습니다. 잠시 후 다시 시도해 주세요."
+        case .server(let message): message
+        }
+    }
+}
+
+private enum RecommendationAPI {
+    static let endpoint = URL(string: "https://pdvemspkknlfapdzkwhz.supabase.co/functions/v1/chat")!
+
+    private static func clientSecret() throws -> String {
+        guard let value = Bundle.main.object(forInfoDictionaryKey: "ARCHClientSecret") as? String,
+              !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw RecommendationError.server("로컬 서버 연결 키가 없습니다. Config/LocalSecrets.xcconfig를 설정해 주세요.")
+        }
+        return value
+    }
+
+    static func recommend(question: String, location: CLLocation, radius: Int, accessToken: String,
+                          previousPlaces: [CompanionPOI]) async throws -> (String, [CompanionPOI], String, Bool) {
+        var request = URLRequest(url: endpoint)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 45
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        request.setValue(try clientSecret(), forHTTPHeaderField: "X-ARCH-Client-Key")
+        request.httpBody = try JSONSerialization.data(withJSONObject: [
+            "question": question,
+            "lat": location.coordinate.latitude,
+            "lng": location.coordinate.longitude,
+            "searchRadiusMeters": radius,
+            "userLanguageCode": "ko",
+            "engine": "gpu",
+            "places": previousPlaces.prefix(15).map { poi in
+                ["id": poi.id, "name": poi.name, "category": poi.category,
+                 "address": poi.address, "lat": poi.latitude, "lng": poi.longitude,
+                 "distanceMeters": poi.distanceMeters] as [String: Any]
+            },
+            "recent_recommended_ids": previousPlaces.prefix(3).map(\.id)
+        ])
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse else { throw RecommendationError.invalidResponse }
+        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw RecommendationError.invalidResponse
+        }
+        guard (200...299).contains(http.statusCode), object["success"] as? Bool == true else {
+            throw RecommendationError.server(object["message"] as? String ?? "추천 서버가 응답하지 않았습니다.")
+        }
+
+        let answer = (object["answer"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let primary = object["top_places"] as? [[String: Any]] ?? []
+        let all = object["places"] as? [[String: Any]] ?? []
+        var seen = Set<String>()
+        let places = (primary + all).compactMap { raw -> CompanionPOI? in
+            guard let poi = makePOI(raw, origin: location) else { return nil }
+            return seen.insert(poi.id).inserted ? poi : nil
+        }
+        let model = object["model"] as? String ?? "알 수 없음"
+        let gpuUsed = (object["gpuOrchestration"] as? [String: Any])?["used"] as? Bool ?? false
+        return (answer.isEmpty ? "추천 결과를 확인해 주세요." : answer, places, model, gpuUsed)
+    }
+
+    static func probe(accessToken: String) async throws -> String {
+        var request = URLRequest(url: endpoint.appendingPathComponent("plan"))
+        request.httpMethod = "POST"
+        request.timeoutInterval = 10
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        request.setValue(try clientSecret(), forHTTPHeaderField: "X-ARCH-Client-Key")
+        request.httpBody = try JSONSerialization.data(withJSONObject: ["question": "연결 확인"])
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse else { throw RecommendationError.invalidResponse }
+        guard (200...299).contains(http.statusCode),
+              let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              object["success"] as? Bool == true else {
+            throw RecommendationError.server("chat/plan HTTP \(http.statusCode)")
+        }
+        return "연결됨 · HTTP \(http.statusCode)"
+    }
+
+    private static func makePOI(_ raw: [String: Any], origin: CLLocation) -> CompanionPOI? {
+        func text(_ keys: String...) -> String? {
+            for key in keys {
+                if let value = raw[key] as? String, !value.isEmpty { return value }
+            }
+            return nil
+        }
+        func number(_ keys: String...) -> Double? {
+            for key in keys {
+                if let value = raw[key] as? NSNumber { return value.doubleValue }
+                if let value = raw[key] as? String, let parsed = Double(value) { return parsed }
+            }
+            return nil
+        }
+        guard let name = text("displayName", "name", "placeName", "place_name"),
+              let latitude = number("lat", "latitude", "y"),
+              let longitude = number("lng", "longitude", "x"),
+              (-90...90).contains(latitude), (-180...180).contains(longitude),
+              latitude != 0, longitude != 0 else { return nil }
+        let id = text("id", "placeId", "place_id") ?? "\(name)-\(latitude)-\(longitude)"
+        let rawCategory = text("category", "subCategory", "majorCategory") ?? "장소"
+        let category: String
+        switch rawCategory.lowercased() {
+        case "cafe", "카페": category = "카페"
+        case "restaurant", "food", "음식점", "식당": category = "음식점"
+        case "medical", "약국", "병원": category = "의료"
+        case "shopping", "shop", "쇼핑": category = "쇼핑"
+        case "convenience", "편의점": category = "생활"
+        default: category = rawCategory
+        }
+        let distance = Int(origin.distance(from: CLLocation(latitude: latitude, longitude: longitude)).rounded())
+        return CompanionPOI(id: id, name: name, category: category,
+                            address: text("address", "roadAddress", "road_address_name", "address_name") ?? "주소 정보 없음",
+                            summary: text("oneLine", "summary", "description") ?? "추천 장소",
+                            latitude: latitude, longitude: longitude,
+                            distanceMeters: distance, rating: number("rating", "score") ?? 0)
+    }
+}
+
 @MainActor
 final class CompanionAppModel: ObservableObject {
     @Published var query = ""
@@ -22,16 +205,24 @@ final class CompanionAppModel: ObservableObject {
     @Published var favoriteIDs: Set<String> = []
     @Published var recentSearches = ["조용한 카페", "점심 맛집", "약국"]
     @Published var aiPrompt = ""
-    @Published var aiAnswer = "원하는 장소의 분위기나 목적을 입력하면 주변 후보를 정리해 드려요."
+    @Published var recommendationMessages: [RecommendationMessage] = [
+        .init(role: .assistant, text: "안녕하세요! 지금 계신 곳 주변에서 어떤 장소를 찾으세요?", places: [])
+    ]
+    @Published var isRecommending = false
+    @Published var recommendationLocation: CLLocationCoordinate2D?
+    @Published var isLocatingOnMap = false
+    @Published var mapLocationError: String?
+    @Published var supabaseProbeStatus = "확인 전"
+    @Published var isProbingSupabase = false
+    @Published var lastRecommendationStatus = "요청 전"
+    @Published var lastRecommendationModel = "-"
+    @Published var lastRecommendationGPU = "-"
+    @Published var lastRecommendationAt: Date?
+    @Published var lastRecommendationAccuracy: Double?
+    private let locationProvider = RecommendationLocationProvider()
 
     let categories = ["전체", "카페", "음식점", "쇼핑", "생활", "의료"]
-    let pois: [CompanionPOI] = [
-        .init(id: "cafe-1", name: "모노 커피", category: "카페", address: "안산시 상록구 광덕1로", summary: "조용한 좌석과 넓은 창이 있는 로스터리", latitude: 37.30191, longitude: 126.83812, distanceMeters: 86, rating: 4.7),
-        .init(id: "food-1", name: "담소 키친", category: "음식점", address: "안산시 상록구 한양대학로", summary: "가볍게 먹기 좋은 한식과 계절 메뉴", latitude: 37.30142, longitude: 126.83901, distanceMeters: 142, rating: 4.5),
-        .init(id: "shop-1", name: "아카이브 문구", category: "쇼핑", address: "안산시 상록구 성안길", summary: "디자인 문구와 작은 로컬 굿즈 숍", latitude: 37.30218, longitude: 126.83744, distanceMeters: 205, rating: 4.6),
-        .init(id: "life-1", name: "24시 편의점", category: "생활", address: "안산시 상록구 석호로", summary: "간단한 식품과 생활용품", latitude: 37.30098, longitude: 126.83874, distanceMeters: 248, rating: 4.2),
-        .init(id: "medical-1", name: "중앙 약국", category: "의료", address: "안산시 상록구 광덕대로", summary: "처방 조제와 일반 의약품 상담", latitude: 37.30242, longitude: 126.83922, distanceMeters: 331, rating: 4.4)
-    ]
+    @Published var pois: [CompanionPOI] = []
 
     var filteredPOIs: [CompanionPOI] {
         pois.filter { poi in
@@ -58,38 +249,218 @@ final class CompanionAppModel: ObservableObject {
         else { favoriteIDs.insert(poi.id) }
     }
 
-    func askAI() {
+    func locateOnMap() {
+        guard !isLocatingOnMap else { return }
+        isLocatingOnMap = true
+        mapLocationError = nil
+        locationProvider.request { [weak self] result in
+            guard let self else { return }
+            self.isLocatingOnMap = false
+            switch result {
+            case .success(let location):
+                self.recommendationLocation = location.coordinate
+            case .failure(let error):
+                self.mapLocationError = error.localizedDescription
+            }
+        }
+    }
+
+    func askAI(auth: CompanionAuthSession) {
         let prompt = aiPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !prompt.isEmpty else { return }
-        let candidates = filteredPOIs.prefix(3).map(\.name).joined(separator: ", ")
-        aiAnswer = candidates.isEmpty
-            ? "조건에 맞는 후보가 아직 없습니다. 검색 범위를 넓혀보세요."
-            : "현재 위치와 조건을 기준으로 \(candidates)을 먼저 살펴보는 것을 추천해요."
+        guard !prompt.isEmpty, !isRecommending else { return }
+        guard auth.isAuthenticated else {
+            recommendationMessages.append(.init(role: .assistant,
+                text: CompanionAuthError.loginRequired.localizedDescription, places: []))
+            return
+        }
         aiPrompt = ""
+        recommendationMessages.append(.init(role: .user, text: prompt, places: []))
+        isRecommending = true
+        lastRecommendationStatus = "GPS 확인 중"
+        locationProvider.request { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .failure(let error):
+                self.recommendationMessages.append(.init(role: .assistant, text: error.localizedDescription, places: []))
+                self.isRecommending = false
+                self.lastRecommendationStatus = "GPS 실패: \(error.localizedDescription)"
+            case .success(let location):
+                self.lastRecommendationAccuracy = location.horizontalAccuracy
+                self.lastRecommendationStatus = "Supabase 요청 중"
+                Task {
+                    do {
+                        let accessToken = try await auth.validAccessToken()
+                        let isFollowUp = ["그중", "그 중", "각각", "방금", "위에서", "거기", "그곳", "비교"]
+                            .contains { prompt.contains($0) } || self.pois.contains { prompt.contains($0.name) }
+                        let (answer, places, serverModel, gpuUsed) = try await RecommendationAPI.recommend(
+                            question: prompt, location: location,
+                            radius: UserDefaults.standard.integer(forKey: "companionSearchRadius") == 0
+                                ? 500 : UserDefaults.standard.integer(forKey: "companionSearchRadius"),
+                            accessToken: accessToken,
+                            previousPlaces: isFollowUp ? self.pois : [])
+                        self.recommendationMessages.append(.init(role: .assistant, text: answer, places: Array(places.prefix(3))))
+                        self.pois = places
+                        self.recommendationLocation = location.coordinate
+                        self.selectedCategory = "전체"
+                        self.query = ""
+                        self.lastRecommendationStatus = "성공 · 장소 \(places.count)곳"
+                        self.lastRecommendationModel = serverModel
+                        self.lastRecommendationGPU = gpuUsed ? "사용됨" : "미사용 또는 확인 불가"
+                    } catch {
+                        self.recommendationMessages.append(.init(role: .assistant,
+                            text: "추천 요청 실패: \(error.localizedDescription)", places: []))
+                        self.lastRecommendationStatus = "실패: \(error.localizedDescription)"
+                    }
+                    self.lastRecommendationAt = Date()
+                    self.isRecommending = false
+                }
+            }
+        }
+    }
+
+    func probeSupabase(auth: CompanionAuthSession) {
+        guard !isProbingSupabase else { return }
+        isProbingSupabase = true
+        supabaseProbeStatus = "연결 확인 중"
+        Task {
+            do {
+                let token = try await auth.validAccessToken()
+                supabaseProbeStatus = try await RecommendationAPI.probe(accessToken: token)
+            }
+            catch { supabaseProbeStatus = "실패: \(error.localizedDescription)" }
+            isProbingSupabase = false
+        }
     }
 }
 
 struct ContentView: View {
     @StateObject private var bridge = QuestLocationBridge()
     @StateObject private var model = CompanionAppModel()
+    @StateObject private var auth = CompanionAuthSession()
 
     var body: some View {
         TabView {
             NavigationStack { DiscoverView() }
                 .tabItem { Label("탐색", systemImage: "sparkle.magnifyingglass") }
+            NavigationStack { AIRecommendationChatView() }
+                .tabItem { Label("AI 추천", systemImage: "bubble.left.and.bubble.right.fill") }
             NavigationStack { CompanionMapView() }
                 .tabItem { Label("지도", systemImage: "map.fill") }
             NavigationStack { SavedPlacesView() }
                 .tabItem { Label("저장", systemImage: "heart.fill") }
-            NavigationStack { ProfileView() }
-                .tabItem { Label("프로필", systemImage: "person.crop.circle") }
-            NavigationStack { HeadingCalibrationView(bridge: bridge) }
-                .tabItem { Label("헤딩 보정", systemImage: "safari") }
-            NavigationStack { DeviceHubView(bridge: bridge) }
-                .tabItem { Label("기기", systemImage: "vision.pro") }
+            NavigationStack { OtherView(bridge: bridge) }
+                .tabItem { Label("기타", systemImage: "ellipsis.circle") }
         }
         .environmentObject(model)
+        .environmentObject(auth)
         .tint(.indigo)
+    }
+}
+
+private struct AIRecommendationChatView: View {
+    @EnvironmentObject private var model: CompanionAppModel
+    @EnvironmentObject private var auth: CompanionAuthSession
+    @FocusState private var promptFocused: Bool
+
+    var body: some View {
+        VStack(spacing: 0) {
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(spacing: 16) {
+                        ForEach(model.recommendationMessages) { message in
+                            messageRow(message)
+                                .id(message.id)
+                        }
+                        if model.isRecommending {
+                            HStack {
+                                ProgressView()
+                                Text("현재 위치에서 장소를 찾는 중…")
+                                    .font(.subheadline)
+                                    .foregroundStyle(.secondary)
+                                Spacer()
+                            }
+                            .padding(14)
+                            .background(.background, in: RoundedRectangle(cornerRadius: 18))
+                            .id("loading")
+                        }
+                    }
+                    .padding(16)
+                }
+                .defaultScrollAnchor(.bottom)
+                .onChange(of: model.recommendationMessages.count) { _, _ in
+                    if let last = model.recommendationMessages.last {
+                        withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
+                    }
+                }
+                .onChange(of: model.isRecommending) { _, loading in
+                    if loading { withAnimation { proxy.scrollTo("loading", anchor: .bottom) } }
+                }
+            }
+
+            HStack(alignment: .bottom, spacing: 10) {
+                TextField("근처에서 찾고 싶은 장소를 물어보세요", text: $model.aiPrompt, axis: .vertical)
+                    .lineLimit(1...4)
+                    .focused($promptFocused)
+                    .submitLabel(.send)
+                    .onSubmit(send)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 10)
+                    .background(.background, in: RoundedRectangle(cornerRadius: 20))
+                Button(action: send) {
+                    Image(systemName: "arrow.up")
+                        .font(.headline)
+                        .foregroundStyle(.white)
+                        .frame(width: 40, height: 40)
+                        .background(.indigo, in: Circle())
+                }
+                .disabled(model.aiPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || model.isRecommending)
+                .accessibilityLabel("질문 보내기")
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 10)
+            .background(.regularMaterial)
+        }
+        .background(Color(uiColor: .systemGroupedBackground))
+        .navigationTitle("AI 추천")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+
+    private func send() {
+        guard !model.aiPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        promptFocused = false
+        model.askAI(auth: auth)
+    }
+
+    @ViewBuilder
+    private func messageRow(_ message: RecommendationMessage) -> some View {
+        HStack(alignment: .bottom) {
+            if message.role == .user { Spacer(minLength: 52) }
+            VStack(alignment: .leading, spacing: 10) {
+                Text(message.text)
+                    .font(.body)
+                    .foregroundStyle(message.role == .user ? .white : .primary)
+                    .textSelection(.enabled)
+                ForEach(message.places) { poi in
+                    Button { model.selectedPOI = poi } label: {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(poi.name).font(.subheadline.bold())
+                            Text("\(poi.distanceMeters)m · \(poi.category)")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(10)
+                        .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 10))
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(14)
+            .background(message.role == .user ? Color.indigo : Color(uiColor: .systemBackground),
+                        in: RoundedRectangle(cornerRadius: 18))
+            if message.role == .assistant { Spacer(minLength: 52) }
+        }
+        .sheet(item: $model.selectedPOI) { POIDetailView(poi: $0) }
     }
 }
 
@@ -185,21 +556,15 @@ private struct DiscoverView: View {
 
                 SectionTitle("주변 추천", trailing: "\(model.filteredPOIs.count)곳")
                 LazyVStack(spacing: 12) {
+                    if model.filteredPOIs.isEmpty {
+                        ContentUnavailableView("추천 장소가 없습니다", systemImage: "mappin.and.ellipse",
+                            description: Text("AI 추천 탭에서 원하는 장소를 물어보세요."))
+                    }
                     ForEach(model.filteredPOIs) { poi in
                         POIRow(poi: poi)
                     }
                 }
 
-                VStack(alignment: .leading, spacing: 12) {
-                    Label("AI에게 조건으로 찾기", systemImage: "sparkles").font(.headline)
-                    Text(model.aiAnswer).font(.subheadline).foregroundStyle(.secondary)
-                    HStack {
-                        TextField("예: 조용하고 콘센트 있는 카페", text: $model.aiPrompt)
-                            .textFieldStyle(.roundedBorder).submitLabel(.send).onSubmit { model.askAI() }
-                        Button { model.askAI() } label: { Image(systemName: "arrow.up.circle.fill").font(.title2) }
-                    }
-                }
-                .padding(16).background(.indigo.opacity(0.08), in: RoundedRectangle(cornerRadius: 18))
             }
             .padding(16)
         }
@@ -218,7 +583,10 @@ private struct POIRow: View {
                 RoundedRectangle(cornerRadius: 14).fill(.indigo.opacity(0.12)).frame(width: 58, height: 58)
                     .overlay(Image(systemName: icon).font(.title2).foregroundStyle(.indigo))
                 VStack(alignment: .leading, spacing: 4) {
-                    HStack { Text(poi.name).font(.headline); Text("★ \(poi.rating, specifier: "%.1f")").font(.caption).foregroundStyle(.orange) }
+                    HStack {
+                        Text(poi.name).font(.headline)
+                        if poi.rating > 0 { Text("★ \(poi.rating, specifier: "%.1f")").font(.caption).foregroundStyle(.orange) }
+                    }
                     Text(poi.summary).font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
                     Text("\(poi.distanceMeters)m · \(poi.category)").font(.caption).foregroundStyle(.secondary)
                 }
@@ -286,6 +654,26 @@ private struct CompanionMapView: View {
             }
         }
         .mapControls { MapCompass(); MapUserLocationButton(); MapScaleView() }
+        .onAppear { model.locateOnMap() }
+        .onReceive(model.$recommendationLocation) { coordinate in
+            guard let coordinate else { return }
+            position = .region(MKCoordinateRegion(center: coordinate,
+                span: MKCoordinateSpan(latitudeDelta: 0.01, longitudeDelta: 0.01)))
+        }
+        .overlay(alignment: .topTrailing) {
+            VStack(alignment: .trailing, spacing: 8) {
+                Button { model.locateOnMap() } label: {
+                    Label("내 위치", systemImage: "location.fill")
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(model.isLocatingOnMap)
+                if model.isLocatingOnMap { ProgressView("GPS 확인 중").padding(8).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8)) }
+                if let error = model.mapLocationError {
+                    Text(error).font(.caption).padding(8).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+                }
+            }
+            .padding(12)
+        }
         .safeAreaInset(edge: .bottom) {
             if let poi = model.selectedPOI {
                 HStack { VStack(alignment: .leading) { Text(poi.name).font(.headline); Text("\(poi.distanceMeters)m · \(poi.category)").font(.caption).foregroundStyle(.secondary) }; Spacer(); Image(systemName: "vision.pro") }
@@ -311,6 +699,7 @@ private struct SavedPlacesView: View {
 }
 
 private struct ProfileView: View {
+    @EnvironmentObject private var auth: CompanionAuthSession
     @AppStorage("companionDisplayName") private var displayName = "ARCH 사용자"
     @AppStorage("companionSearchRadius") private var searchRadius = 500.0
     @AppStorage("companionLanguage") private var language = "한국어"
@@ -323,7 +712,7 @@ private struct ProfileView: View {
                     VStack(alignment: .leading) { Text(displayName).font(.headline); Text("Companion 계정").foregroundStyle(.secondary) }
                 }
             }
-            Section("프로필") { TextField("표시 이름", text: $displayName); LabeledContent("로그인 상태", value: "프로토타입") }
+            Section("프로필") { TextField("표시 이름", text: $displayName); LabeledContent("로그인 상태", value: auth.email ?? "로그아웃") }
             Section("검색 설정") {
                 Picker("언어", selection: $language) { Text("한국어").tag("한국어"); Text("English").tag("English") }
                 VStack(alignment: .leading) { Text("기본 반경 \(Int(searchRadius))m"); Slider(value: $searchRadius, in: 100...1000, step: 100) }
@@ -331,6 +720,104 @@ private struct ProfileView: View {
             Section("권한") { Label("위치: 앱 사용 중", systemImage: "location.fill"); Label("Bluetooth: 기기 연결", systemImage: "wave.3.right") }
         }
         .navigationTitle("프로필 및 설정")
+    }
+}
+
+private struct OtherView: View {
+    @EnvironmentObject private var model: CompanionAppModel
+    @EnvironmentObject private var auth: CompanionAuthSession
+    @ObservedObject var bridge: QuestLocationBridge
+    @State private var authEmail = ""
+    @State private var authPassword = ""
+    @State private var nickname = ""
+    @State private var isSigningUp = false
+    @State private var authMessage: String?
+
+    var body: some View {
+        Form {
+            Section("계정") {
+                if auth.isAuthenticated {
+                    LabeledContent("로그인", value: auth.email ?? "-")
+                    Button("로그아웃", role: .destructive) {
+                        auth.signOut()
+                        authMessage = nil
+                    }
+                } else {
+                    TextField("이메일", text: $authEmail)
+                        .textContentType(.emailAddress)
+                        .keyboardType(.emailAddress)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                    SecureField("비밀번호", text: $authPassword)
+                        .textContentType(isSigningUp ? .newPassword : .password)
+                    if isSigningUp {
+                        TextField("닉네임", text: $nickname)
+                    }
+                    Button(isSigningUp ? "회원가입" : "로그인") { submitAuth() }
+                        .disabled(auth.isWorking || authEmail.isEmpty || authPassword.isEmpty || (isSigningUp && nickname.isEmpty))
+                    Button(isSigningUp ? "기존 계정으로 로그인" : "계정 만들기") {
+                        isSigningUp.toggle()
+                        authMessage = nil
+                    }
+                    if auth.isWorking { ProgressView() }
+                }
+                if let authMessage { Text(authMessage).font(.footnote).foregroundStyle(.secondary) }
+                Text(auth.status).font(.footnote).foregroundStyle(.secondary)
+            }
+            Section("앱 도구") {
+                NavigationLink { ProfileView() } label: { Label("프로필 및 설정", systemImage: "person.crop.circle") }
+                NavigationLink { HeadingCalibrationView(bridge: bridge) } label: { Label("헤딩 보정", systemImage: "safari") }
+                NavigationLink { DeviceHubView(bridge: bridge) } label: { Label("기기 연결", systemImage: "vision.pro") }
+            }
+            Section("Supabase 연결") {
+                LabeledContent("프로젝트", value: "pdvemspkknlfapdzkwhz")
+                LabeledContent("함수", value: "chat")
+                LabeledContent("상태", value: model.supabaseProbeStatus)
+                Button {
+                    model.probeSupabase(auth: auth)
+                } label: {
+                    HStack {
+                        Label("연결 확인", systemImage: "network")
+                        if model.isProbingSupabase { Spacer(); ProgressView() }
+                    }
+                }
+                .disabled(model.isProbingSupabase)
+            }
+
+            Section("최근 AI 추천 요청") {
+                LabeledContent("결과", value: model.lastRecommendationStatus)
+                LabeledContent("응답 모델", value: model.lastRecommendationModel)
+                LabeledContent("GPU", value: model.lastRecommendationGPU)
+                LabeledContent("요청 시각", value: model.lastRecommendationAt?.formatted(date: .abbreviated, time: .standard) ?? "-")
+                LabeledContent("GPS 정확도", value: model.lastRecommendationAccuracy.map { String(format: "%.1f m", $0) } ?? "-")
+                LabeledContent("표시된 장소", value: "\(model.pois.count)곳")
+            }
+
+            Section {
+                Text("연결 확인은 chat/plan 함수만 호출하며 추천 작업을 만들지 않습니다. GPU 사용 여부는 마지막 추천 응답에서 확인합니다.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .navigationTitle("기타")
+    }
+
+    private func submitAuth() {
+        let email = authEmail.trimmingCharacters(in: .whitespacesAndNewlines)
+        let name = nickname.trimmingCharacters(in: .whitespacesAndNewlines)
+        Task {
+            do {
+                if isSigningUp {
+                    try await auth.signUp(email: email, password: authPassword, nickname: name)
+                } else {
+                    try await auth.signIn(email: email, password: authPassword)
+                }
+                authPassword = ""
+                authMessage = auth.status
+            } catch {
+                authMessage = error.localizedDescription
+            }
+        }
     }
 }
 
@@ -369,6 +856,19 @@ private struct DeviceHubView: View {
                     Text("탐색 또는 지도에서 안내할 장소를 선택하세요.").foregroundStyle(.secondary)
                 }
                 LabeledContent("GPS 전송", value: "\(bridge.sentCount)회")
+            }
+
+            Section("AI 추천 위치") {
+                Text("현재 AI 추천 결과를 Quest에 보내면 Unity의 디버그 추천은 지워지고, 추천 장소가 보라색 POI로 표시됩니다. 일반 표시 거리 밖의 장소도 함께 생성됩니다.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                LabeledContent("추천 장소", value: "\(model.pois.count)곳")
+                Button {
+                    bridge.sendAiRecommendationsOnQuest(model.pois)
+                } label: {
+                    Label("AI 추천 위치를 Quest에 표시", systemImage: "sparkles")
+                }
+                .disabled(!bridge.isRunning || model.pois.isEmpty)
             }
 
             Section("Quest 초기 방향 보정") {

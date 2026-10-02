@@ -21,6 +21,28 @@ private struct LocationPacket: Codable {
     let headingSource: String?
 }
 
+private struct AiRecommendationPacket: Codable {
+    let type: String
+    let source: String
+    let sequence: UInt64
+    let timestamp: TimeInterval
+    let clearDebugRecommendations: Bool
+    let recommendations: [AiRecommendationItem]
+}
+
+private struct AiRecommendationItem: Codable {
+    let poiId: String
+    let name: String
+    let category: String
+    let address: String
+    let description: String
+    let latitude: Double
+    let longitude: Double
+    let distanceMeters: Float
+    let score: Float
+    let reason: String
+}
+
 enum CompanionLocationMode: String, CaseIterable, Identifiable {
     case real = "실제 GPS"
     case virtual = "가상 GPS"
@@ -202,6 +224,78 @@ final class QuestLocationBridge: NSObject, ObservableObject, CLLocationManagerDe
         sendHeadingPacket(location)
     }
 
+    func sendAiRecommendationsOnQuest(_ pois: [CompanionPOI]) {
+        guard isRunning else {
+            statusText = "먼저 Quest 연결을 시작하세요"
+            addEvent("AI 추천 전송 실패 · Quest 연결 없음")
+            return
+        }
+
+        let selected = Array(pois.prefix(10))
+        guard !selected.isEmpty else {
+            statusText = "전송할 AI 추천 장소가 없습니다"
+            addEvent("AI 추천 전송 실패 · 추천 장소 없음")
+            return
+        }
+
+        sequence += 1
+        let packet = AiRecommendationPacket(
+            type: "arch.ai_recommendations.v1",
+            source: "xcode",
+            sequence: sequence,
+            timestamp: Date().timeIntervalSince1970,
+            clearDebugRecommendations: true,
+            recommendations: selected.enumerated().map { index, poi in
+                AiRecommendationItem(
+                    poiId: poi.id,
+                    name: poi.name,
+                    category: poi.category,
+                    address: poi.address,
+                    description: poi.summary,
+                    latitude: poi.latitude,
+                    longitude: poi.longitude,
+                    distanceMeters: Float(max(0, poi.distanceMeters)),
+                    score: max(0.7, min(1.0, 0.96 - Float(index) * 0.04)),
+                    reason: poi.summary)
+            })
+
+        do {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+            let wireData = try JSONEncoder().encode(packet)
+            lastPacketText = String(decoding: try encoder.encode(packet), as: UTF8.self)
+
+            if usesBLE {
+                sendAiRecommendationsBLE(wireData, sequence: packet.sequence)
+            } else {
+                guard let connection else {
+                    statusText = "UDP 연결이 없습니다"
+                    addEvent("AI 추천 전송 실패 · UDP 연결 없음")
+                    return
+                }
+                lastPacketSizeText = "\(wireData.count) B"
+                connection.send(content: wireData, completion: .contentProcessed { [weak self] error in
+                    Task { @MainActor in
+                        guard let self else { return }
+                        if let error {
+                            self.statusText = "AI 추천 전송 실패: \(error.localizedDescription)"
+                            self.addEvent("AI 추천 전송 실패 · \(error.localizedDescription)")
+                        } else {
+                            self.sentCount += 1
+                            self.lastSentAt = Date()
+                            self.lastSentAgoText = "방금"
+                            self.statusText = "AI 추천 \(selected.count)곳을 Quest에 표시"
+                            self.addEvent("#\(packet.sequence) AI 추천 \(selected.count)곳 전송 완료")
+                        }
+                    }
+                })
+            }
+        } catch {
+            statusText = "AI 추천 JSON 오류: \(error.localizedDescription)"
+            addEvent("AI 추천 JSON 인코딩 실패 · \(error.localizedDescription)")
+        }
+    }
+
     func startHeadingCalibrationMode() {
         guard isRunning else {
             statusText = "먼저 Quest GPS 연결을 시작하세요"
@@ -346,6 +440,7 @@ final class QuestLocationBridge: NSObject, ObservableObject, CLLocationManagerDe
             addEvent("BLE 전송 보류 · Quest 미연결")
             return
         }
+
         sequence += 1
         let packet = LocationPacket(type: "arch.location.v1", source: packetSource,
                                     sequence: sequence,
@@ -384,6 +479,33 @@ final class QuestLocationBridge: NSObject, ObservableObject, CLLocationManagerDe
             statusText = "BLE JSON 오류: \(error.localizedDescription)"
             addEvent("BLE 인코딩 실패 · \(error.localizedDescription)")
         }
+    }
+
+    private func sendAiRecommendationsBLE(_ wireData: Data, sequence: UInt64) {
+        guard let peripheral = questPeripheral, let characteristic = locationCharacteristic else {
+            statusText = "Quest BLE 연결을 기다리는 중"
+            addEvent("AI 추천 전송 보류 · Quest 미연결")
+            return
+        }
+
+        var framedData = wireData
+        framedData.append(0x0A)
+        let maximum = max(20, peripheral.maximumWriteValueLength(for: .withoutResponse))
+        var offset = 0
+        while offset < framedData.count {
+            let end = min(offset + maximum, framedData.count)
+            peripheral.writeValue(framedData.subdata(in: offset..<end),
+                                  for: characteristic,
+                                  type: .withoutResponse)
+            offset = end
+        }
+
+        lastPacketSizeText = "\(framedData.count) B"
+        sentCount += 1
+        lastSentAt = Date()
+        lastSentAgoText = "방금"
+        statusText = "AI 추천을 Quest에 표시"
+        addEvent("#\(sequence) BLE AI 추천 전송 완료")
     }
 
     private func startUpdatingHeadingIfAvailable() {

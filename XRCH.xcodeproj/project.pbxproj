@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXFileReference section */
+		000000000000000000000121 /* ClientConfig.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Config/ClientConfig.xcconfig; sourceTree = "<group>"; };
 		000000000000000000000120 /* XRCH.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = XRCH.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -31,6 +32,7 @@
 			isa = PBXGroup;
 			children = (
 				000000000000000000000010 /* XRCH */,
+				000000000000000000000121 /* ClientConfig.xcconfig */,
 				000000000000000000000020 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -117,6 +119,7 @@
 /* Begin XCBuildConfiguration section */
 		000000000000000011000000 /* Debug configuration for PBXProject "XRCH" */ = {
 			isa = XCBuildConfiguration;
+			baseConfigurationReference = 000000000000000000000121 /* ClientConfig.xcconfig */;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
 				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
@@ -187,6 +190,7 @@
 		};
 		000000000000000012000000 /* Release configuration for PBXProject "XRCH" */ = {
 			isa = XCBuildConfiguration;
+			baseConfigurationReference = 000000000000000000000121 /* ClientConfig.xcconfig */;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
 				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
@@ -257,6 +261,7 @@
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_ARCHClientSecret = "$(ARCH_CLIENT_SECRET)";
 				INFOPLIST_KEY_NSBluetoothAlwaysUsageDescription = "Quest 헤드셋에 현재 위치를 전송하기 위해 Bluetooth를 사용합니다.";
 				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "Quest 헤드셋으로 현재 위치를 전송하기 위해 로컬 네트워크를 사용합니다.";
 				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "AR 글라스에 현재 위치를 전달하기 위해 iPhone 위치를 사용합니다.";
@@ -298,6 +303,7 @@
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_ARCHClientSecret = "$(ARCH_CLIENT_SECRET)";
 				INFOPLIST_KEY_NSBluetoothAlwaysUsageDescription = "Quest 헤드셋에 현재 위치를 전송하기 위해 Bluetooth를 사용합니다.";
 				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "Quest 헤드셋으로 현재 위치를 전송하기 위해 로컬 네트워크를 사용합니다.";
 				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "AR 글라스에 현재 위치를 전달하기 위해 iPhone 위치를 사용합니다.";
