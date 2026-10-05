@@ -84,25 +84,16 @@ private enum RecommendationError: LocalizedError {
     }
 }
 
+@MainActor
 private enum RecommendationAPI {
-    static let endpoint = URL(string: "https://pdvemspkknlfapdzkwhz.supabase.co/functions/v1/chat")!
+    static let endpoint = SupabaseConfiguration.functionsURL.appendingPathComponent("chat")
 
-    private static func clientSecret() throws -> String {
-        guard let value = Bundle.main.object(forInfoDictionaryKey: "ARCHClientSecret") as? String,
-              !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw RecommendationError.server("로컬 서버 연결 키가 없습니다. Config/LocalSecrets.xcconfig를 설정해 주세요.")
-        }
-        return value
-    }
-
-    static func recommend(question: String, location: CLLocation, radius: Int, accessToken: String,
+    static func recommend(question: String, location: CLLocation, radius: Int, auth: CompanionAuthSession,
                           previousPlaces: [CompanionPOI]) async throws -> (String, [CompanionPOI], String, Bool) {
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
         request.timeoutInterval = 45
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
-        request.setValue(try clientSecret(), forHTTPHeaderField: "X-ARCH-Client-Key")
         request.httpBody = try JSONSerialization.data(withJSONObject: [
             "question": question,
             "lat": location.coordinate.latitude,
@@ -118,13 +109,16 @@ private enum RecommendationAPI {
             "recent_recommended_ids": previousPlaces.prefix(3).map(\.id)
         ])
 
-        let (data, response) = try await URLSession.shared.data(for: request)
-        guard let http = response as? HTTPURLResponse else { throw RecommendationError.invalidResponse }
+        let (data, http) = try await auth.authenticatedRequest(request)
         guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw RecommendationError.invalidResponse
         }
         guard (200...299).contains(http.statusCode), object["success"] as? Bool == true else {
-            throw RecommendationError.server(object["message"] as? String ?? "추천 서버가 응답하지 않았습니다.")
+            if http.statusCode == 429, object["code"] as? String == "DAILY_QUOTA_EXCEEDED" {
+                let reset = auth.usage?.resetDate.map { " \($0.formatted(date: .abbreviated, time: .shortened))부터 다시 사용할 수 있습니다." } ?? ""
+                throw RecommendationError.server("오늘의 무료 AI 추천을 모두 사용했습니다.\(reset) 검색·지도는 계속 이용할 수 있습니다. 계정 로그인은 기타 탭에서 할 수 있습니다.")
+            }
+            throw RecommendationError.server(object["message"] as? String ?? "추천 서버가 응답하지 않았습니다. (HTTP \(http.statusCode))")
         }
 
         let answer = (object["answer"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -140,16 +134,13 @@ private enum RecommendationAPI {
         return (answer.isEmpty ? "추천 결과를 확인해 주세요." : answer, places, model, gpuUsed)
     }
 
-    static func probe(accessToken: String) async throws -> String {
+    static func probe(auth: CompanionAuthSession) async throws -> String {
         var request = URLRequest(url: endpoint.appendingPathComponent("plan"))
         request.httpMethod = "POST"
         request.timeoutInterval = 10
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
-        request.setValue(try clientSecret(), forHTTPHeaderField: "X-ARCH-Client-Key")
         request.httpBody = try JSONSerialization.data(withJSONObject: ["question": "연결 확인"])
-        let (data, response) = try await URLSession.shared.data(for: request)
-        guard let http = response as? HTTPURLResponse else { throw RecommendationError.invalidResponse }
+        let (data, http) = try await auth.authenticatedRequest(request)
         guard (200...299).contains(http.statusCode),
               let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               object["success"] as? Bool == true else {
@@ -268,11 +259,6 @@ final class CompanionAppModel: ObservableObject {
     func askAI(auth: CompanionAuthSession) {
         let prompt = aiPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !prompt.isEmpty, !isRecommending else { return }
-        guard auth.isAuthenticated else {
-            recommendationMessages.append(.init(role: .assistant,
-                text: CompanionAuthError.loginRequired.localizedDescription, places: []))
-            return
-        }
         aiPrompt = ""
         recommendationMessages.append(.init(role: .user, text: prompt, places: []))
         isRecommending = true
@@ -289,14 +275,13 @@ final class CompanionAppModel: ObservableObject {
                 self.lastRecommendationStatus = "Supabase 요청 중"
                 Task {
                     do {
-                        let accessToken = try await auth.validAccessToken()
                         let isFollowUp = ["그중", "그 중", "각각", "방금", "위에서", "거기", "그곳", "비교"]
                             .contains { prompt.contains($0) } || self.pois.contains { prompt.contains($0.name) }
                         let (answer, places, serverModel, gpuUsed) = try await RecommendationAPI.recommend(
                             question: prompt, location: location,
                             radius: UserDefaults.standard.integer(forKey: "companionSearchRadius") == 0
                                 ? 500 : UserDefaults.standard.integer(forKey: "companionSearchRadius"),
-                            accessToken: accessToken,
+                            auth: auth,
                             previousPlaces: isFollowUp ? self.pois : [])
                         self.recommendationMessages.append(.init(role: .assistant, text: answer, places: Array(places.prefix(3))))
                         self.pois = places
@@ -324,8 +309,7 @@ final class CompanionAppModel: ObservableObject {
         supabaseProbeStatus = "연결 확인 중"
         Task {
             do {
-                let token = try await auth.validAccessToken()
-                supabaseProbeStatus = try await RecommendationAPI.probe(accessToken: token)
+                supabaseProbeStatus = try await RecommendationAPI.probe(auth: auth)
             }
             catch { supabaseProbeStatus = "실패: \(error.localizedDescription)" }
             isProbingSupabase = false
@@ -353,6 +337,7 @@ struct ContentView: View {
         }
         .environmentObject(model)
         .environmentObject(auth)
+        .task { await auth.prepareGuestSession() }
         .tint(.indigo)
     }
 }
@@ -364,6 +349,17 @@ private struct AIRecommendationChatView: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            if auth.isGuest {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(auth.usageStatus).font(.subheadline)
+                    if let reset = auth.usage?.resetDate {
+                        Text("\(reset.formatted(date: .abbreviated, time: .shortened))에 초기화")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 16).padding(.vertical, 8)
+            }
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(spacing: 16) {
@@ -423,6 +419,7 @@ private struct AIRecommendationChatView: View {
         .background(Color(uiColor: .systemGroupedBackground))
         .navigationTitle("AI 추천")
         .navigationBarTitleDisplayMode(.inline)
+        .task { await auth.refreshUsage() }
     }
 
     private func send() {
@@ -712,7 +709,7 @@ private struct ProfileView: View {
                     VStack(alignment: .leading) { Text(displayName).font(.headline); Text("Companion 계정").foregroundStyle(.secondary) }
                 }
             }
-            Section("프로필") { TextField("표시 이름", text: $displayName); LabeledContent("로그인 상태", value: auth.email ?? "로그아웃") }
+            Section("프로필") { TextField("표시 이름", text: $displayName); LabeledContent("로그인 상태", value: auth.isGuest ? "게스트" : (auth.email ?? "연결 준비 중")) }
             Section("검색 설정") {
                 Picker("언어", selection: $language) { Text("한국어").tag("한국어"); Text("English").tag("English") }
                 VStack(alignment: .leading) { Text("기본 반경 \(Int(searchRadius))m"); Slider(value: $searchRadius, in: 100...1000, step: 100) }
@@ -736,12 +733,20 @@ private struct OtherView: View {
     var body: some View {
         Form {
             Section("계정") {
+                if auth.isGuest {
+                    LabeledContent("사용 모드", value: "게스트")
+                    Text("로그인 없이 기본 기능을 사용할 수 있습니다. AI 추천은 서버의 일일 한도가 적용됩니다.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
                 if auth.isAuthenticated {
                     LabeledContent("로그인", value: auth.email ?? "-")
                     Button("로그아웃", role: .destructive) {
-                        auth.signOut()
-                        authMessage = nil
+                        Task {
+                            do { try await auth.signOut(); authMessage = nil }
+                            catch { authMessage = error.localizedDescription }
+                        }
                     }
+                    .disabled(auth.isWorking)
                 } else {
                     TextField("이메일", text: $authEmail)
                         .textContentType(.emailAddress)
@@ -763,6 +768,15 @@ private struct OtherView: View {
                 }
                 if let authMessage { Text(authMessage).font(.footnote).foregroundStyle(.secondary) }
                 Text(auth.status).font(.footnote).foregroundStyle(.secondary)
+                if !auth.hasSession {
+                    Button("게스트 연결 다시 시도") { Task { await auth.prepareGuestSession() } }
+                        .disabled(auth.isWorking)
+                }
+                if auth.hasSession {
+                    Text(auth.usageStatus).font(.footnote).foregroundStyle(.secondary)
+                    Button("남은 사용량 확인") { Task { await auth.refreshUsage() } }
+                        .disabled(auth.isWorking)
+                }
             }
             Section("앱 도구") {
                 NavigationLink { ProfileView() } label: { Label("프로필 및 설정", systemImage: "person.crop.circle") }

@@ -10,11 +10,11 @@ ARCH 위치 기반 AR 앱을 위한 iPhone 동반 앱 프로토타입입니다. 
 - 위치와 헤딩 데이터를 UDP 또는 BLE로 전달
 - AI 추천 장소를 Quest에 보라색 POI로 표시
 - 현재 헤딩으로 Quest 방향 보정, 실시간 헤딩 보정 모드
-- AI 추천 탭: 로그인한 사용자의 토큰과 실제 iPhone GPS로 Supabase `chat` 함수에 질문을 보내고 GPU 추천 답변과 장소를 대화로 표시
+- AI 추천 탭: 익명 또는 로그인 사용자의 토큰과 실제 iPhone GPS로 Supabase `chat` 함수에 질문을 보내고 GPU 추천 답변과 장소를 대화로 표시
 - 기타 탭: Supabase Auth 로그인·회원가입·로그아웃, `chat/plan` 인증 연결 확인, 마지막 추천 요청 상태·응답 모델·GPU 사용 여부·GPS 정확도 확인
 - 개발자 진단: 연결/권한/네트워크 상태, 좌표, 정확도, 최근 패킷, 이벤트 로그
 
-탐색·지도 화면의 장소는 AI 추천 응답으로 갱신됩니다. 저장·프로필은 현재 로컬 UI 프로토타입입니다. AI 추천에는 로그인, 위치 권한과 네트워크 연결이 필요하며, Supabase/GPU 워커 상태에 따라 응답이 실패할 수 있습니다. 로그인 세션은 iPhone Keychain에 저장되고 만료되면 서버 `refresh` 함수로 갱신됩니다.
+탐색·지도 화면의 장소는 AI 추천 응답으로 갱신됩니다. 저장·프로필은 현재 로컬 UI 프로토타입입니다. AI 추천은 로그인 없이 익명 인증 세션으로 사용할 수 있습니다. 위치 권한과 네트워크 연결이 필요하며, Supabase/GPU 워커 상태에 따라 응답이 실패할 수 있습니다. 익명·로그인 세션의 access/refresh token은 iPhone Keychain에 저장되고 Supabase Auth API로 갱신됩니다. 익명 사용자는 서버 기준 하루 5회(한국 시간 자정 초기화)의 GPU 예산을 사용하며 AI 추천 탭에 남은 횟수를 표시합니다. 일반 계정에서 로그아웃하면 기존 게스트 세션을 복원하므로 로그인 전의 사용량이 유지됩니다. 서버의 `usage` 함수와 GPU quota migration 배포가 필요합니다.
 
 ## 요구 사항
 
@@ -130,9 +130,17 @@ BLE에서는 기존 위치 패킷과 동일하게 JSON 뒤에 줄바꿈을 붙�
 
 앱은 iPhone 위치를 앱 사용 중에 읽고, Bluetooth로 Quest를 검색·연결하며, UDP 사용 시 로컬 네트워크에 접근합니다. AI 추천 질문과 현재 위치는 Supabase Edge Function으로 전송되고 서버의 GPU 추천 작업에 사용됩니다. Quest 위치/헤딩 패킷을 중계하는 외부 서버는 없습니다.
 
-## 개인 iPhone 빌드의 서버 연결 키
+## Supabase 게스트 인증
 
-`Config/LocalSecrets.xcconfig.example`을 `Config/LocalSecrets.xcconfig`로 복사하고 `ARCH_CLIENT_SECRET`에 Supabase Edge Function 비밀값과 같은 임의의 긴 값을 넣습니다. 이 로컬 파일은 Git에서 제외됩니다. 값이 없으면 AI 추천과 연결 확인 요청은 앱에서 중단됩니다. 서버의 `chat`, `gpu`, `search`, `nearby` 함수도 같은 값을 요구합니다. GPU 워커에도 `ARCH_CLIENT_SECRET` 환경변수를 설정해야 검색이 동작합니다. 이 값은 개인 설치 앱을 위한 공유 접근 키이며, 앱을 다른 사람에게 배포할 때는 사용자별 인증과 서버 측 사용량 제한을 사용해야 합니다.
+앱 시작 시 Supabase Auth의 `/auth/v1/signup`에 빈 JSON을 보내 익명 세션을 생성합니다. 기존 세션이 있으면 Keychain에서 복원하고, 만료 전 `/auth/v1/token?grant_type=refresh_token`으로 갱신합니다. 동시에 발생한 인증 요청은 한 작업을 공유합니다. 네트워크 장애 때 기존 세션을 삭제하거나 새 게스트 계정을 생성하지 않습니다.
+
+`XRCH/SupabaseConfiguration.swift`에는 프로젝트 URL과 서버 웹 클라이언트에 공개된 legacy anon 키만 있습니다. 이 키는 공개 클라이언트 설정이며 사용자 권한을 대신하지 않습니다. service-role 키나 GPU 서버 비밀값을 앱에 넣지 않습니다. 기존 ARCH_CLIENT_SECRET은 추천 요청에 사용하지 않습니다.
+
+추천과 연결 확인 요청은 `Authorization: Bearer <사용자 JWT>` 및 프로젝트 `apikey` 헤더를 보냅니다. 게스트에게 로그인 폼 입력을 요구하지 않습니다. 계정 화면은 게스트와 정식 로그인을 구분하고, 기존 이메일 로그인은 선택적으로 유지합니다. Apple 로그인은 후속 구현입니다.
+
+실제 연결에는 서버 관리자가 Supabase 익명 인증을 활성화하고, JWT 지원 및 게스트 GPU 한도 PR을 배포해야 합니다. 서버 PR이 배포되기 전에는 인증 비활성화 오류 또는 API_KEY_REQUIRED가 발생할 수 있습니다. config.toml 변경만으로 운영 설정이 바뀌지 않습니다.
+
+GPU 일일 한도 응답(429)은 초기화 시각과 함께 표시합니다. 정식 계정 로그아웃은 Supabase의 해당 세션을 종료한 뒤 기존 게스트 세션을 복원합니다. 계정 연결·삭제, App Attest 및 폐기된 세션의 복구 UX는 후속 작업입니다. 기본 탐색 화면의 기존 데이터 소스는 이 변경에서 수정하지 않습니다.
 
 ## 프로젝트 구성
 
@@ -140,3 +148,14 @@ BLE에서는 기존 위치 패킷과 동일하게 JSON 뒤에 줄바꿈을 붙�
 - `XRCH/CompanionAppViews.swift`: 탐색, 지도, 기기, 헤딩 보정 화면
 - `XRCH/ContentView.swift`: 개발자 진단 패널
 - `XRCH/QuestLocationBridge.swift`: Core Location, Core Bluetooth, UDP, 패킷 직렬화
+
+## 익명 인증 검증
+
+실제 Supabase와 Keychain을 변경하지 않는 모의 인증 검증:
+
+```sh
+xcrun swiftc -swift-version 5 -parse-as-library XRCH/SupabaseConfiguration.swift XRCH/CompanionUsage.swift XRCH/CompanionAuthSession.swift Tests/AuthSessionHarness.swift -o /tmp/xrch-auth-tests
+/tmp/xrch-auth-tests
+```
+
+네트워크 또는 Keychain 읽기 실패 시 저장된 익명 계정을 버리지 않습니다. 서버가 access token을 401로 거절하면 한 번 갱신 후 재요청하고, 429·서버 오류·타임아웃은 자동 재시도하지 않습니다. 실패 환급·추천 요청 재전송 멱등성은 서버 후속 작업입니다.
