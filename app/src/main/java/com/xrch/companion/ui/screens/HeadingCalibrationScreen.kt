@@ -31,10 +31,13 @@ import com.xrch.companion.ui.theme.IndigoPrimary
 import com.xrch.companion.ui.theme.StatusGreen
 import com.xrch.companion.ui.theme.StatusRed
 
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun HeadingCalibrationScreen(
-    bridge: QuestLocationBridge
+    bridge: QuestLocationBridge,
+    onNavigateBack: (() -> Unit)? = null
 ) {
     val bridgeState by bridge.state.collectAsState()
 
@@ -46,7 +49,14 @@ fun HeadingCalibrationScreen(
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("헤딩 보정", fontWeight = FontWeight.Bold) }
+                title = { Text("헤딩 보정", fontWeight = FontWeight.Bold) },
+                navigationIcon = {
+                    if (onNavigateBack != null) {
+                        IconButton(onClick = onNavigateBack) {
+                            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "뒤로가기")
+                        }
+                    }
+                }
             )
         }
     ) { padding ->

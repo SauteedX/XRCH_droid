@@ -29,8 +29,11 @@ import android.net.NetworkRequest
 import android.os.Build
 import android.os.Bundle
 import android.os.ParcelUuid
+import com.xrch.companion.data.AiRecommendationItem
+import com.xrch.companion.data.AiRecommendationPacket
 import com.xrch.companion.data.BridgeState
 import com.xrch.companion.data.CompanionLocationMode
+import com.xrch.companion.data.CompanionPOI
 import com.xrch.companion.data.LocationPacket
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -199,6 +202,62 @@ class QuestLocationBridge(private val context: Context) : LocationListener, Sens
             sendBLE(location)
         } else {
             sendUDP(location)
+        }
+    }
+
+    fun getLatestLocation(): Location? = latestLocation
+
+    fun sendAiRecommendationsOnQuest(pois: List<CompanionPOI>) {
+        if (!_state.value.isRunning) {
+            _state.update { it.copy(statusText = "먼저 Quest 연결을 시작하세요") }
+            addEvent("AI 추천 전송 실패 · Quest 연결 없음")
+            return
+        }
+
+        val selected = pois.take(10)
+        if (selected.isEmpty()) {
+            _state.update { it.copy(statusText = "전송할 AI 추천 장소가 없습니다") }
+            addEvent("AI 추천 전송 실패 · 추천 장소 없음")
+            return
+        }
+
+        sequence += 1
+        val currentSeq = sequence
+        val packet = AiRecommendationPacket(
+            type = "arch.ai_recommendations.v1",
+            source = "android",
+            sequence = currentSeq,
+            timestamp = System.currentTimeMillis() / 1000.0,
+            clearDebugRecommendations = true,
+            recommendations = selected.mapIndexed { index, poi ->
+                AiRecommendationItem(
+                    poiId = poi.id,
+                    name = poi.name,
+                    category = poi.category,
+                    address = poi.address,
+                    description = poi.summary,
+                    latitude = poi.latitude,
+                    longitude = poi.longitude,
+                    distanceMeters = maxOf(0, poi.distanceMeters).toFloat(),
+                    score = maxOf(0.7f, minOf(1.0f, 0.96f - index * 0.04f)),
+                    reason = poi.summary
+                )
+            }
+        )
+
+        val wireData = packet.toJson().toByteArray(Charsets.UTF_8)
+        val prettyJson = packet.toJson(pretty = true)
+        _state.update {
+            it.copy(
+                lastPacketText = prettyJson,
+                lastPacketSizeText = "${wireData.size} B"
+            )
+        }
+
+        if (usesBLE) {
+            sendAiRecommendationsBLE(wireData, currentSeq, selected.size)
+        } else {
+            sendAiRecommendationsUDP(wireData, currentSeq, selected.size)
         }
     }
 
@@ -496,6 +555,87 @@ class QuestLocationBridge(private val context: Context) : LocationListener, Sens
                 withContext(Dispatchers.Main) {
                     _state.update { it.copy(statusText = "BLE 전송 오류: ${e.localizedMessage}") }
                     addEvent("BLE 전송 실패 · ${e.localizedMessage}")
+                }
+            }
+        }
+    }
+
+    private fun sendAiRecommendationsUDP(wireData: ByteArray, currentSeq: Long, count: Int) {
+        val host = _state.value.questHost
+        if (host.isEmpty()) {
+            _state.update { it.copy(statusText = "UDP 연결이 없습니다") }
+            addEvent("AI 추천 전송 실패 · UDP 연결 없음")
+            return
+        }
+
+        scope.launch(Dispatchers.IO) {
+            try {
+                DatagramSocket().use { socket ->
+                    val address = InetAddress.getByName(host)
+                    val datagram = DatagramPacket(wireData, wireData.size, address, PORT)
+                    socket.send(datagram)
+                }
+                withContext(Dispatchers.Main) {
+                    lastSentAt = Date()
+                    _state.update {
+                        it.copy(
+                            sentCount = it.sentCount + 1,
+                            lastSentAgoText = "방금",
+                            statusText = "AI 추천 ${count}곳을 Quest에 표시"
+                        )
+                    }
+                    addEvent("#$currentSeq AI 추천 ${count}곳 전송 완료")
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    _state.update { it.copy(statusText = "AI 추천 전송 실패: ${e.localizedMessage}") }
+                    addEvent("AI 추천 전송 실패 · ${e.localizedMessage}")
+                }
+            }
+        }
+    }
+
+    private fun sendAiRecommendationsBLE(rawBytes: ByteArray, currentSeq: Long, count: Int) {
+        val gatt = bluetoothGatt
+        val char = locationCharacteristic
+        if (gatt == null || char == null) {
+            _state.update { it.copy(statusText = "Quest BLE 연결을 기다리는 중") }
+            addEvent("AI 추천 전송 보류 · Quest 미연결")
+            return
+        }
+
+        val wireData = ByteArray(rawBytes.size + 1).apply {
+            System.arraycopy(rawBytes, 0, this, 0, rawBytes.size)
+            this[rawBytes.size] = 0x0A // '\n' terminator
+        }
+
+        scope.launch(Dispatchers.IO) {
+            try {
+                val chunkSize = maxOf(20, currentMtu)
+                var offset = 0
+                while (offset < wireData.size) {
+                    val end = minOf(offset + chunkSize, wireData.size)
+                    val chunk = wireData.copyOfRange(offset, end)
+                    writeCharacteristic(gatt, char, chunk)
+                    offset = end
+                    if (offset < wireData.size) delay(8)
+                }
+
+                withContext(Dispatchers.Main) {
+                    lastSentAt = Date()
+                    _state.update {
+                        it.copy(
+                            sentCount = it.sentCount + 1,
+                            lastSentAgoText = "방금",
+                            statusText = "AI 추천 ${count}곳을 Quest에 표시"
+                        )
+                    }
+                    addEvent("#$currentSeq BLE AI 추천 전송 완료")
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    _state.update { it.copy(statusText = "AI 추천 전송 실패: ${e.localizedMessage}") }
+                    addEvent("AI 추천 전송 실패 · ${e.localizedMessage}")
                 }
             }
         }

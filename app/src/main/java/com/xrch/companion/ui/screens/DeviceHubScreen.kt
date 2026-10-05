@@ -32,7 +32,8 @@ import com.xrch.companion.ui.viewmodel.CompanionViewModel
 fun DeviceHubScreen(
     bridge: QuestLocationBridge,
     viewModel: CompanionViewModel,
-    onNavigateToDiagnostics: () -> Unit
+    onNavigateToDiagnostics: () -> Unit,
+    onNavigateBack: (() -> Unit)? = null
 ) {
     val bridgeState by bridge.state.collectAsState()
     var showUdpDialog by remember { mutableStateOf(false) }
@@ -41,7 +42,14 @@ fun DeviceHubScreen(
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("연결 기기", fontWeight = FontWeight.Bold) }
+                title = { Text("연결 기기", fontWeight = FontWeight.Bold) },
+                navigationIcon = {
+                    if (onNavigateBack != null) {
+                        IconButton(onClick = onNavigateBack) {
+                            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "뒤로가기")
+                        }
+                    }
+                }
             )
         }
     ) { padding ->
@@ -240,6 +248,45 @@ fun DeviceHubScreen(
                     ) {
                         Text("전송 소스", color = MaterialTheme.colorScheme.onSurfaceVariant)
                         Text(bridgeState.locationSourceText, fontWeight = FontWeight.SemiBold)
+                    }
+                }
+            }
+
+            // AI 추천 위치 Card
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(18.dp),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+            ) {
+                Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text("AI 추천 위치", fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                    Text(
+                        "현재 AI 추천 결과를 Quest에 보내면 Unity의 디버그 추천은 지워지고, 추천 장소가 보라색 POI로 표시됩니다. 일반 표시 거리 밖의 장소도 함께 생성됩니다.",
+                        fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text("추천 장소", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 13.sp)
+                        Text("${viewModel.allPois.size}곳", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                    }
+
+                    Button(
+                        onClick = {
+                            bridge.sendAiRecommendationsOnQuest(viewModel.allPois)
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(12.dp),
+                        enabled = bridgeState.isRunning && viewModel.allPois.isNotEmpty(),
+                        colors = ButtonDefaults.buttonColors(containerColor = IndigoPrimary)
+                    ) {
+                        Icon(Icons.Default.AutoAwesome, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(8.dp))
+                        Text("AI 추천 위치를 Quest에 표시")
                     }
                 }
             }

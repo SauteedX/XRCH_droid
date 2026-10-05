@@ -22,15 +22,25 @@ import androidx.compose.ui.unit.sp
 import com.xrch.companion.ui.theme.IndigoPrimary
 import com.xrch.companion.ui.viewmodel.CompanionViewModel
 
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ProfileScreen(
-    viewModel: CompanionViewModel
+    viewModel: CompanionViewModel,
+    onNavigateBack: (() -> Unit)? = null
 ) {
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("프로필 및 설정", fontWeight = FontWeight.Bold) }
+                title = { Text("프로필 및 설정", fontWeight = FontWeight.Bold) },
+                navigationIcon = {
+                    if (onNavigateBack != null) {
+                        IconButton(onClick = onNavigateBack) {
+                            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "뒤로가기")
+                        }
+                    }
+                }
             )
         }
     ) { padding ->

@@ -31,7 +31,8 @@ import com.xrch.companion.ui.viewmodel.CompanionViewModel
 @Composable
 fun DiscoverScreen(
     viewModel: CompanionViewModel,
-    onNavigateToDeviceHub: () -> Unit = {}
+    onNavigateToDeviceHub: () -> Unit = {},
+    onNavigateToAiChat: () -> Unit = {}
 ) {
     var showDetailDialog by remember { mutableStateOf<CompanionPOI?>(null) }
 
@@ -171,7 +172,13 @@ fun DiscoverScreen(
                             )
                             Spacer(Modifier.width(8.dp))
                             IconButton(
-                                onClick = { viewModel.askAI() },
+                                onClick = {
+                                    val prompt = viewModel.aiPrompt.trim()
+                                    if (prompt.isNotEmpty()) {
+                                        viewModel.askAI(prompt)
+                                        onNavigateToAiChat()
+                                    }
+                                },
                                 colors = IconButtonDefaults.iconButtonColors(containerColor = IndigoPrimary)
                             ) {
                                 Icon(Icons.Default.ArrowUpward, contentDescription = "전송", tint = Color.White)
@@ -187,46 +194,61 @@ fun DiscoverScreen(
 
     // POI Detail Dialog
     showDetailDialog?.let { poi ->
-        AlertDialog(
-            onDismissRequest = { showDetailDialog = null },
-            title = {
-                Text(poi.name, fontWeight = FontWeight.Bold)
+        POIDetailDialog(
+            poi = poi,
+            onNavigateToDeviceHub = {
+                viewModel.selectedPOI = poi
+                onNavigateToDeviceHub()
             },
-            text = {
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text(poi.summary, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(Icons.Default.Place, contentDescription = null, tint = IndigoPrimary, modifier = Modifier.size(16.dp))
-                        Spacer(Modifier.width(4.dp))
-                        Text(poi.address, fontSize = 13.sp)
-                    }
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(Icons.AutoMirrored.Filled.DirectionsWalk, contentDescription = null, tint = IndigoPrimary, modifier = Modifier.size(16.dp))
-                        Spacer(Modifier.width(4.dp))
-                        Text("${poi.distanceMeters}m 거리", fontSize = 13.sp)
-                    }
-                    Text("★ ${poi.rating} · ${poi.category}", fontWeight = FontWeight.SemiBold, color = Color(0xFFF59E0B))
-                }
-            },
-            confirmButton = {
-                Button(
-                    onClick = {
-                        viewModel.selectedPOI = poi
-                        showDetailDialog = null
-                        onNavigateToDeviceHub()
-                    },
-                    colors = ButtonDefaults.buttonColors(containerColor = IndigoPrimary)
-                ) {
-                    Text("글라스에서 안내 시작")
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { showDetailDialog = null }) {
-                    Text("닫기")
-                }
-            }
+            onDismiss = { showDetailDialog = null }
         )
     }
+}
+
+@Composable
+fun POIDetailDialog(
+    poi: CompanionPOI,
+    onNavigateToDeviceHub: (() -> Unit)? = null,
+    onDismiss: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Text(poi.name, fontWeight = FontWeight.Bold)
+        },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(poi.summary, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Default.Place, contentDescription = null, tint = IndigoPrimary, modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(4.dp))
+                    Text(poi.address, fontSize = 13.sp)
+                }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.AutoMirrored.Filled.DirectionsWalk, contentDescription = null, tint = IndigoPrimary, modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(4.dp))
+                    Text("${poi.distanceMeters}m 거리", fontSize = 13.sp)
+                }
+                Text("★ ${poi.rating} · ${poi.category}", fontWeight = FontWeight.SemiBold, color = Color(0xFFF59E0B))
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    onDismiss()
+                    onNavigateToDeviceHub?.invoke()
+                },
+                colors = ButtonDefaults.buttonColors(containerColor = IndigoPrimary)
+            ) {
+                Text(if (onNavigateToDeviceHub != null) "글라스에서 안내 시작" else "확인")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("닫기")
+            }
+        }
+    )
 }
 
 @Composable
