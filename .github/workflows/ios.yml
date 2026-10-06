@@ -1,0 +1,87 @@
+name: Build iOS (XRCH Xcode)
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  test:
+    name: Run Swift Unit Tests
+    runs-on: macos-15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Select Xcode Version
+        run: |
+          sudo xcode-select -s /Applications/Xcode_16.2.app || sudo xcode-select -s /Applications/Xcode_16.1.app || sudo xcode-select -s /Applications/Xcode_16.0.app || true
+          xcodebuild -version
+
+      - name: Run Auth Session Test Harness
+        run: |
+          xcrun swiftc -swift-version 5 -parse-as-library \
+            XRCH/SupabaseConfiguration.swift \
+            XRCH/CompanionUsage.swift \
+            XRCH/CompanionAuthSession.swift \
+            Tests/AuthSessionHarness.swift \
+            -o /tmp/xrch-auth-tests
+          /tmp/xrch-auth-tests
+
+  build-ios:
+    name: Build iOS App & Unsigned IPA
+    runs-on: macos-15
+    needs: test
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Select Xcode Version
+        run: |
+          sudo xcode-select -s /Applications/Xcode_16.2.app || sudo xcode-select -s /Applications/Xcode_16.1.app || sudo xcode-select -s /Applications/Xcode_16.0.app || true
+          xcodebuild -version
+
+      - name: Setup Local Secrets Configuration
+        run: |
+          if [ -n "${{ secrets.ARCH_CLIENT_SECRET }}" ]; then
+            echo "ARCH_CLIENT_SECRET = ${{ secrets.ARCH_CLIENT_SECRET }}" > Config/LocalSecrets.xcconfig
+          else
+            echo "// No private secret provided, using empty secret" > Config/LocalSecrets.xcconfig
+            echo "ARCH_CLIENT_SECRET =" >> Config/LocalSecrets.xcconfig
+          fi
+
+      - name: Build Xcode Project (Release - Unsigned)
+        run: |
+          xcodebuild -project XRCH.xcodeproj \
+                     -scheme XRCH \
+                     -configuration Release \
+                     -sdk iphoneos \
+                     -derivedDataPath build/derivedData \
+                     CODE_SIGNING_ALLOWED=NO \
+                     CODE_SIGNING_REQUIRED=NO \
+                     CODE_SIGN_IDENTITY="" \
+                     clean build
+
+      - name: Package Unsigned IPA
+        run: |
+          mkdir -p build/Payload
+          APP_PATH=$(find build/derivedData/Build/Products/Release-iphoneos -name "*.app" -type d | head -n 1)
+          if [ -z "$APP_PATH" ]; then
+            echo "Error: .app bundle not found!"
+            find build/derivedData -maxdepth 5 || true
+            exit 1
+          fi
+          echo "Found compiled app at: $APP_PATH"
+          cp -R "$APP_PATH" build/Payload/
+          cd build && zip -r XRCH_iOS_unsigned.ipa Payload
+
+      - name: Upload Unsigned IPA Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: XRCH-iOS-Unsigned-IPA
+          path: build/XRCH_iOS_unsigned.ipa
+          retention-days: 7
